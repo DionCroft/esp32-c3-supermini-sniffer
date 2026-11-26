@@ -97,7 +97,7 @@ Known quirks worth documenting: a `460800` baud USB-Serial-JTAG resync race can 
 
 ## Provenance
 
-Every commissioned build in this repo's lineage was verified the same way: hash-gated source → clean PlatformIO build → flash → **esptool byte-level read-back** of both partitions, with SHA-256 compared against the build artifacts. Screenshot below is the dashboard as served by the device.
+Every commissioned build in this repo's lineage was verified the same way: hash-gated source → clean PlatformIO build → flash → **esptool byte-level read-back** of both partitions, with SHA-256 compared against the build artifacts. Screenshots below render the **shipped** `data/index.html` against a schema-accurate API mock (deterministic values); on-device photos land here after the hardware commissioning milestone.
 
 ![Sweep in TRON theme](docs/screenshots/dashboard-tron.png)
 
