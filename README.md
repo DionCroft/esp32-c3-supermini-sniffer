@@ -19,10 +19,11 @@ A **standalone passive 2.4 GHz WiFi channel analyser** with an offline **8-bit d
 - **LIVE PACKETS** — capture ring with subtype names, type filter, hide-own-traffic toggle
 - **NETWORKS** — per-BSSID table (RSSI, rates, SSID), row-click RSSI history chart
 - **PACKET RATE** — 120 s throughput chart with peak marker; **FRAME MIX** and **TOP MGMT SUBTYPES** bars
+- **SESSIONS** — one-click recording sessions with crash-safe 60 s debounced flush, rotating keep-3 store on littleFS, downloadable **CSV** (strict line-per-record) and **JSON** exports, and a client-side PNG snapshot of the rate chart — no cloud involved
 - **EVENTS engine** — on-device anomaly detection: `NEW_SSID` (60 s grace), `DEAUTH_BURST` (3 in 10 s), `RATE_SPIKE` (≥2× vs 60 s baseline, 15 s rearm), suspicious pairs; littleFS-backed ring + `/api/events`
 - **ADVENTURE LOG** — the dashboard narrates discoveries in retro style
 - **FARM / TRON themes** + procedural 8-bit SFX (WebAudio) — everything is local; the UI has **zero external resources** (two OFL fonts embedded as data-URIs)
-- **Serial console** — `sweep [2-10|stop]`, `home`, `ch <1-13>`, `diag`, `events [clear]`
+- **Serial console** — `sweep [2-10|stop]`, `home`, `ch <1-13>`, `diag`, `events [clear]`, `session [start|stop|list]`
 
 ## Architecture
 
@@ -30,7 +31,7 @@ A **standalone passive 2.4 GHz WiFi channel analyser** with an offline **8-bit d
 |---|---|
 | Firmware | `src/main.cpp` — 2,111 lines, Arduino framework, **legacy** `esp_wifi_set_promiscuous*` API (IDF 4.4-compatible), all timing loop/`millis()`-driven |
 | Dashboard | `data/index.html` — 772 lines, single file, no build step, no dependencies |
-| API | 11 GET endpoints, 2 s polling via `Promise.allSettled` |
+| API | 16 GET endpoints, 2 s polling via `Promise.allSettled` |
 | Storage | littleFS event ring (`/events.json`, 16 KB cap, 5 s debounce flush) + NVS (`sniffer/homech`) |
 | Bounds | 512-packet ring · 64 BSS · 32 SSID · 32 events · saturation-safe semantics |
 
@@ -49,6 +50,11 @@ A **standalone passive 2.4 GHz WiFi channel analyser** with an offline **8-bit d
 | `/api/sweep` | Sweep state/results |
 | `/api/sweep/start?dwell=` | Start sweep (2–10 s dwell) |
 | `/api/sweep/stop` | Stop sweep, restore home |
+| `/api/session` | Session state (active, elapsed, frames) |
+| `/api/session/start` | Begin recording session |
+| `/api/session/stop` | Close session, flush `/sN.json` + `/sN.csv` (rotation: newest 3) |
+| `/api/session/list` | Closed sessions index |
+| `/api/session/export?fmt=csv\|json&id=N` | Download attachment (404 on unknown id) |
 
 ## Build & flash
 
@@ -90,7 +96,7 @@ Known quirks worth documenting: a `460800` baud USB-Serial-JTAG resync race can 
 - [x] S2 — 8-bit UI (FARM/TRON, SFX)
 - [x] S3 — Channel sweep + commissioning (C1/C2, byte-verified partitions)
 - [x] S4 — Event/anomaly engine (**C3 commissioned**: flashed, partitions verified, events proven live on-device)
-- [ ] S5 — Session logging + CSV/JSON export + PNG snapshot
+- [x] S5 — Session logging + CSV/JSON export + chart PNG snapshot (**C4 commissioned**: lifecycle, rotation, exports and byte-identical dashboard proven on-device over HTTP)
 - [ ] S6 — Offline OUI vendor lookup + client tracker
 - [ ] S7 — Beacon sequence analysis (BSS uptime/restart detection)
 - [ ] S9 — Device config panel + presets + status LED + OTA
