@@ -181,6 +181,19 @@ border-bottom:1px dashed rgba(0,0,0,.3);white-space:nowrap;overflow:hidden}
 .ev-spike{color:var(--accent2)}
 .evlist li.ev-fresh{animation:evflash 1.5s ease-out}
 @keyframes evflash{0%{background:rgba(255,210,62,.45)}100%{background:transparent}}
+/* clients panel (S6) */
+.vc{display:inline-block;padding:0 6px;font-size:12px;border:2px solid var(--border);color:var(--grass);letter-spacing:.02em}
+html.tron .vc{text-shadow:var(--glow)}
+.vc.unk{color:var(--dim)}
+.ctrack{display:inline-block;width:56px;height:8px;background:var(--plot-dim);border:1px solid var(--border);vertical-align:middle;margin-right:5px}
+.cfill{display:block;height:100%;background:var(--dim)}
+.cfill.f-excellent{background:var(--grass)}
+.cfill.f-good{background:var(--sky)}
+.cfill.f-fair{background:var(--gold)}
+.cfill.f-poor{background:var(--bad)}
+.cli-row{cursor:pointer}
+.cli-row:hover{background:rgba(0,0,0,.22)}
+.cli-det td{color:var(--dim);font-size:13px;white-space:normal}
 /* session panel (S5) */
 #sesschip{font:7px 'Press Start 2P',monospace;color:var(--dim);letter-spacing:.04em}
 #sesschip.rec{color:var(--bad);animation:sesspulse 1.2s steps(2) infinite}
@@ -293,6 +306,18 @@ border-bottom:1px dashed rgba(0,0,0,.3);white-space:nowrap;overflow:hidden}
     </div>
   </div>
 
+  <div class="panel">
+    <div class="head"><h2>CLIENTS (stations via AP) &mdash; click for detail</h2><span class="b" id="clicount" style="color:var(--dim)"></span></div>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th>mac</th><th>vendor</th><th>ap</th><th>rssi</th><th>frames</th><th>last-seen</th>
+        </tr></thead>
+        <tbody id="clis"></tbody>
+      </table>
+    </div>
+  </div>
+
   <div class="panel" id="rssiPanel" style="display:none">
     <div class="head">
       <h2>RSSI HISTORY &mdash; <span id="rssiTitle" style="color:var(--fg)"></span></h2>
@@ -302,14 +327,14 @@ border-bottom:1px dashed rgba(0,0,0,.3);white-space:nowrap;overflow:hidden}
     <div class="vals" id="rssiVals"></div>
   </div>
 
-  <div class="footer">poll every 2 s &middot; /api/stats /api/packets /api/ssids /api/rate /api/frames /api/sweep /api/events /api/session + /api/rssi on click &middot; session export: /api/session/export?fmt=csv|json &middot; SFX off by default &middot; all sound generated in-browser</div>
+  <div class="footer">poll every 2 s &middot; /api/stats /api/packets /api/ssids /api/rate /api/frames /api/sweep /api/events /api/session /api/clients + /api/rssi on click &middot; session export: /api/session/export?fmt=csv|json &middot; 17 endpoints total (incl. /) &middot; SFX off by default &middot; all sound generated in-browser</div>
 </div>
 <div id="spark"></div>
 
 <script>
 "use strict";
 const $=id=>document.getElementById(id);
-const API={stats:'/api/stats',packets:'/api/packets?n=80',ssids:'/api/ssids',rate:'/api/rate',frames:'/api/frames',rssi:b=>'/api/rssi?bssid='+encodeURIComponent(b),sweep:'/api/sweep',sweepStart:d=>'/api/sweep/start?dwell='+d,sweepStop:'/api/sweep/stop',events:'/api/events',session:'/api/session',sessionStart:'/api/session/start',sessionStop:'/api/session/stop',sessionList:'/api/session/list',sessionExport:(id,fmt)=>'/api/session/export?fmt='+fmt+(id!=null?'&id='+encodeURIComponent(id):'')};
+const API={stats:'/api/stats',packets:'/api/packets?n=80',ssids:'/api/ssids',rate:'/api/rate',frames:'/api/frames',rssi:b=>'/api/rssi?bssid='+encodeURIComponent(b),sweep:'/api/sweep',sweepStart:d=>'/api/sweep/start?dwell='+d,sweepStop:'/api/sweep/stop',events:'/api/events',session:'/api/session',sessionStart:'/api/session/start',sessionStop:'/api/session/stop',sessionList:'/api/session/list',sessionExport:(id,fmt)=>'/api/session/export?fmt='+fmt+(id!=null?'&id='+encodeURIComponent(id):''),clients:'/api/clients'};
 const TYPE_NAMES=['MGMT','CTRL','DATA','OTHER'];
 const SUB_NAMES=['assoc-req','assoc-resp','reassoc-req','reassoc-resp','probe-req','probe-resp','reserved','reserved','beacon','atim','disassoc','auth','deauth','action','action-noack','reserved'];
 const CTRL_SUB={8:'Block-ACK-Req',9:'Block-ACK',10:'PS-Poll',11:'RTS',12:'CTS',13:'ACK',14:'CF-End',15:'CF-End-ACK'};
@@ -768,6 +793,75 @@ function renderEvents(d,up){
   }).join('');
 }
 
+/* ---- CLIENTS panel (S6): stations (DATA-frame TAs != BSSID) from
+   /api/clients, polled on the 2 s batch like events/session (failure-
+   tolerant: older firmware keeps the panel idle, never breaks the poll).
+   No per-client RSSI history ring exists server-side (design choice: the
+   history lives in g_bss rows only), so a row click expands INLINE numeric
+   detail (rmin/avg/rmax, first seen, AP) instead of a sparkline - pxChart
+   primitives would need samples the firmware does not keep per client.
+   Newest-active first, capped at 48 rows by the device. Vendor chips are
+   coloured on the device-resolved OUI (oui_known), dim '?' when unknown. ---- */
+let clientsErrOnce=false;
+let lastClients=null,statsUptimeCache=null;
+const openClients=new Set();
+function cliAge(up,ls){
+  if(up==null||ls==null)return '&mdash;';
+  const a=Math.max(0,up-ls);
+  return a<60?a.toFixed(1)+'s':(a<3600?Math.floor(a/60)+'m '+Math.round(a%60)+'s':Math.floor(a/3600)+'h');
+}
+function cliBar(rssi){
+  if(rssi==null)return '<span class="ctrack"><span class="cfill"></span></span>&mdash;';
+  const pct=Math.max(2,Math.min(100,Math.round((rssi+95)*100/60)));
+  const f=rssi>=-60?'f-excellent':(rssi>=-72?'f-good':(rssi>=-82?'f-fair':'f-poor'));
+  return '<span class="ctrack"><span class="cfill '+f+'" style="width:'+pct+'%"></span></span>'+rssi;
+}
+function renderClients(d,up){
+  const tb=$('clis');
+  lastClients=d;statsUptimeCache=up;
+  if(!d){
+    $('clicount').textContent='';
+    tb.innerHTML='<tr><td colspan="6" class="empty">CLIENTS ENDPOINT UNAVAILABLE</td></tr>';
+    return;
+  }
+  const cs=d.clients||[];
+  $('clicount').textContent=cs.length?(' '+cs.length+(d.count!=null&&d.count>cs.length?'/'+d.count:'')+' of 48)'):'';
+  if(!cs.length){tb.innerHTML='<tr><td colspan="6" class="empty">no stations seen yet</td></tr>';return;}
+  tb.innerHTML=cs.map(c=>{
+    const mac=esc(c.mac||'');
+    const known=!!(c.oui_known&&c.vendor&&c.vendor!=='UNKNOWN');
+    const chip=known?'<span class="vc" title="'+esc(c.vendor)+'">'+esc(c.vendor.length>22?c.vendor.slice(0,22)+'\u2026':c.vendor)+'</span>':'<span class="vc unk" title="OUI not in table">?</span>';
+    let row='<tr class="cli-row" data-mac="'+mac+'">'+
+      '<td>'+mac+'</td>'+
+      '<td>'+chip+'</td>'+
+      '<td>'+esc(c.ap||'&mdash;')+'</td>'+
+      '<td class="rssi">'+cliBar(c.rssi)+'</td>'+
+      '<td>'+(c.frames!=null?c.frames.toLocaleString():'&mdash;')+'</td>'+
+      '<td class="rssi">'+cliAge(up,c.last_s)+'</td>'+
+    '</tr>';
+    if(openClients.has(mac)){
+      row+='<tr class="cli-det"><td colspan="6">'+
+        'rssi last '+(c.rssi!=null?c.rssi:'&mdash;')+' &middot; min '+(c.rmin!=null?c.rmin:'&mdash;')+
+        ' &middot; avg '+(c.avg!=null?c.avg:'&mdash;')+' &middot; max '+(c.rmax!=null?c.rmax:'&mdash;')+' dBm'+
+        ' &middot; frames '+(c.frames!=null?c.frames.toLocaleString():'&mdash;')+
+        ' &middot; first seen '+(c.first_s!=null?c.first_s+'s':'&mdash;')+
+        ' &middot; last seen '+(c.last_s!=null?c.last_s+'s':'&mdash;')+' uptime'+
+        ' &middot; ap '+(esc(c.ap)||'&mdash;')+
+        ' &middot; vendor '+(known?esc(c.vendor):'UNKNOWN')+
+      '</td></tr>';
+    }
+    return row;
+  }).join('');
+}
+$('clis').addEventListener('click',e=>{
+  const tr=e.target.closest('tr.cli-row');
+  if(!tr)return;
+  const mac=tr.getAttribute('data-mac');
+  if(openClients.has(mac))openClients.delete(mac);else openClients.add(mac);
+  // re-render from last poll without waiting (cheap: rows are rebuilt anyway)
+  renderClients(lastClients,statsUptimeCache);
+});
+
 /* ---- RSSI history (on row click, existing endpoint) ---- */
 async function showRssi(bssid,ssid){
   const panel=$('rssiPanel');
@@ -809,11 +903,12 @@ async function poll(){
   pollInFlight=true;
   try{
     const results=await Promise.allSettled([
-      jget(API.stats),jget(API.packets),jget(API.ssids),jget(API.rate),jget(API.frames),jget(API.sweep),jget(API.events),jget(API.session)
+      jget(API.stats),jget(API.packets),jget(API.ssids),jget(API.rate),jget(API.frames),jget(API.sweep),jget(API.events),jget(API.session),jget(API.clients)
     ]);
     const sweepRes=results[5];
     const eventsRes=results[6];
     const sessionRes=results[7];
+    const clientsRes=results[8];
     const firstErr=results.slice(0,5).find(r=>r.status==='rejected');
     if(firstErr){
       setLive(false,'poll error: '+(firstErr.reason&&firstErr.reason.message?firstErr.reason.message:String(firstErr.reason)));
@@ -854,6 +949,16 @@ async function poll(){
         addLog('sys','session endpoint unavailable (older firmware?) - session panel idle');
       }
       renderSession(null);
+    }
+    if(clientsRes.status==='fulfilled'){
+      renderClients(clientsRes.value,stats.uptime_s);
+      clientsErrOnce=false;
+    }else{
+      if(!clientsErrOnce){
+        clientsErrOnce=true;
+        addLog('sys','clients endpoint unavailable (older firmware?) - clients panel idle');
+      }
+      renderClients(null,stats.uptime_s);
     }
     setLive(true);
   }catch(e){
