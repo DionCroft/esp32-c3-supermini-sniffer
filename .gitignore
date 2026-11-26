@@ -1,0 +1,9 @@
+.pio/
+
+# ContextGraph private/derived state
+.hermes/contextgraph/contextgraph.sqlite
+.hermes/contextgraph/contextgraph.sqlite-*
+.hermes/contextgraph/index-state.json
+.hermes/contextgraph/context-packs/
+.hermes/contextgraph/checkpoints/
+.hermes/contextgraph/session-bindings/
