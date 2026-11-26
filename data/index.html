@@ -181,6 +181,12 @@ border-bottom:1px dashed rgba(0,0,0,.3);white-space:nowrap;overflow:hidden}
 .ev-spike{color:var(--accent2)}
 .evlist li.ev-fresh{animation:evflash 1.5s ease-out}
 @keyframes evflash{0%{background:rgba(255,210,62,.45)}100%{background:transparent}}
+/* session panel (S5) */
+#sesschip{font:7px 'Press Start 2P',monospace;color:var(--dim);letter-spacing:.04em}
+#sesschip.rec{color:var(--bad);animation:sesspulse 1.2s steps(2) infinite}
+@keyframes sesspulse{50%{opacity:.35}}
+.btn:disabled{opacity:.45;cursor:default}
+.btn:disabled:hover{color:var(--fg)}
 </style>
 </head>
 <body>
@@ -249,6 +255,17 @@ border-bottom:1px dashed rgba(0,0,0,.3);white-space:nowrap;overflow:hidden}
         <div class="note" id="ratepeak">peak &mdash; pps &middot; avg &mdash;</div>
       </div>
       <div class="panel">
+        <div class="head"><h2>SESSION</h2><span class="b" id="sesschip">IDLE</span></div>
+        <div class="controls" style="padding:8px 12px 2px">
+          <button class="btn" id="sessstart">START REC</button>
+          <button class="btn danger" id="sessstop">STOP</button>
+          <button class="btn" id="sesscsv">CSV</button>
+          <button class="btn" id="sessjson">JSON</button>
+          <button class="btn" id="sesssnap">SNAP PNG</button>
+        </div>
+        <div class="note" id="sessinfo">idle</div>
+      </div>
+      <div class="panel">
         <div class="head"><h2>FRAME MIX</h2></div>
         <div id="mix" style="padding:4px 0 10px"></div>
       </div>
@@ -285,14 +302,14 @@ border-bottom:1px dashed rgba(0,0,0,.3);white-space:nowrap;overflow:hidden}
     <div class="vals" id="rssiVals"></div>
   </div>
 
-  <div class="footer">poll every 2 s &middot; /api/stats /api/packets /api/ssids /api/rate /api/frames /api/sweep /api/events + /api/rssi on click &middot; SFX off by default &middot; all sound generated in-browser</div>
+  <div class="footer">poll every 2 s &middot; /api/stats /api/packets /api/ssids /api/rate /api/frames /api/sweep /api/events /api/session + /api/rssi on click &middot; session export: /api/session/export?fmt=csv|json &middot; SFX off by default &middot; all sound generated in-browser</div>
 </div>
 <div id="spark"></div>
 
 <script>
 "use strict";
 const $=id=>document.getElementById(id);
-const API={stats:'/api/stats',packets:'/api/packets?n=80',ssids:'/api/ssids',rate:'/api/rate',frames:'/api/frames',rssi:b=>'/api/rssi?bssid='+encodeURIComponent(b),sweep:'/api/sweep',sweepStart:d=>'/api/sweep/start?dwell='+d,sweepStop:'/api/sweep/stop',events:'/api/events'};
+const API={stats:'/api/stats',packets:'/api/packets?n=80',ssids:'/api/ssids',rate:'/api/rate',frames:'/api/frames',rssi:b=>'/api/rssi?bssid='+encodeURIComponent(b),sweep:'/api/sweep',sweepStart:d=>'/api/sweep/start?dwell='+d,sweepStop:'/api/sweep/stop',events:'/api/events',session:'/api/session',sessionStart:'/api/session/start',sessionStop:'/api/session/stop',sessionList:'/api/session/list',sessionExport:(id,fmt)=>'/api/session/export?fmt='+fmt+(id!=null?'&id='+encodeURIComponent(id):'')};
 const TYPE_NAMES=['MGMT','CTRL','DATA','OTHER'];
 const SUB_NAMES=['assoc-req','assoc-resp','reassoc-req','reassoc-resp','probe-req','probe-resp','reserved','reserved','beacon','atim','disassoc','auth','deauth','action','action-noack','reserved'];
 const CTRL_SUB={8:'Block-ACK-Req',9:'Block-ACK',10:'PS-Poll',11:'RTS',12:'CTS',13:'ACK',14:'CF-End',15:'CF-End-ACK'};
@@ -621,6 +638,79 @@ function renderRate(vals){
   }
 }
 
+/* ---- SESSION panel (S5): one recording at a time (/api/session state on the
+   2 s poll). START/STOP hit /api/session/start|stop then refresh. CSV/JSON
+   download the newest closed session via a hidden anchor (no navigation).
+   SNAP PNG composites the rate chart onto an offscreen canvas with theme
+   colours + title + timestamp footer and toBlob-downloads it client-side
+   (no server round trip, no external resources). ---- */
+let lastSession=null,sessionErrOnce=false;
+function dlUrl(url,filename){
+  const a=document.createElement('a');
+  a.href=url;a.download=filename||'';a.style.display='none';
+  document.body.appendChild(a);a.click();
+  setTimeout(()=>a.remove(),400);
+}
+function sessAge(s){
+  s=Math.max(0,s|0);
+  const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+  const p2=n=>String(n).padStart(2,'0');
+  return h?(h+':'+p2(m)+':'+p2(x)):(m+':'+p2(x));
+}
+function renderSession(d){
+  lastSession=d||null;
+  const chip=$('sesschip'),info=$('sessinfo');
+  if(!d){
+    chip.textContent='N/A';chip.classList.remove('rec');
+    info.textContent='session endpoint unavailable';
+    $('sessstart').disabled=false;$('sessstop').disabled=false;
+    return;
+  }
+  if(d.active){
+    chip.textContent='REC '+sessAge(d.dur_s);
+    chip.classList.add('rec');
+    info.innerHTML='recording &middot; '+(d.frames!=null?d.frames.toLocaleString():'0')+
+      ' frames &middot; started at '+d.start_ms+' ms uptime';
+  }else{
+    chip.textContent='IDLE';
+    chip.classList.remove('rec');
+    info.textContent='idle \u00b7 CSV/JSON download the newest closed session';
+  }
+  $('sessstart').disabled=!!d.active;
+  $('sessstop').disabled=!d.active;
+}
+async function sessHit(url){try{await jget(url);}catch(e){}poll();}
+$('sessstart').addEventListener('click',()=>sessHit(API.sessionStart));
+$('sessstop').addEventListener('click',()=>sessHit(API.sessionStop));
+$('sesscsv').addEventListener('click',()=>dlUrl(API.sessionExport(null,'csv'),'sniffer-session.csv'));
+$('sessjson').addEventListener('click',()=>dlUrl(API.sessionExport(null,'json'),'sniffer-session.json'));
+$('sesssnap').addEventListener('click',()=>{
+  const src=$('ratec');
+  const cs=getComputedStyle(document.documentElement);
+  const col=(n,f)=>(cs.getPropertyValue(n)||'').trim()||f;
+  const PAD=14,TITLE=30,FOOT=20;
+  const off=document.createElement('canvas');
+  off.width=src.width+PAD*2;
+  off.height=src.height+TITLE+FOOT+PAD;
+  const o=off.getContext('2d');
+  o.imageSmoothingEnabled=false;
+  o.fillStyle=col('--panel','#7a4f2a');o.fillRect(0,0,off.width,off.height);
+  o.strokeStyle=col('--border','#4a2f18');o.lineWidth=4;o.strokeRect(2,2,off.width-4,off.height-4);
+  o.fillStyle=col('--title','#ffd23e');o.font="10px 'Press Start 2P',monospace";
+  o.fillText('PACKET RATE (120 s)',PAD,PAD+11);
+  o.fillStyle=col('--plot-dim','#4a3420');o.fillRect(PAD,PAD+TITLE,src.width,src.height);
+  o.drawImage(src,PAD,PAD+TITLE);       // canvas bitmap excludes CSS bg: paint plot-dim behind it
+  o.fillStyle=col('--dim','#888');o.font="13px 'VT323',monospace";
+  const stamp=new Date().toISOString().replace('T',' ').slice(0,19)+' UTC \u00b7 ESP32-C3 sniffer';
+  o.fillText(stamp,PAD,off.height-6);
+  off.toBlob(b=>{
+    if(!b)return;
+    const u=URL.createObjectURL(b);
+    dlUrl(u,'sniffer-rate-'+Math.floor(Date.now()/1000)+'.png');
+    setTimeout(()=>URL.revokeObjectURL(u),8000);
+  },'image/png');
+});
+
 /* ---- frame mix + top mgmt subtypes: blocky pixel bars (DOM, integer widths, square corners) ---- */
 function barRow(label,count,max,cls){
   const w=max>0?Math.max(2,Math.round(100*count/max)):0;
@@ -719,10 +809,11 @@ async function poll(){
   pollInFlight=true;
   try{
     const results=await Promise.allSettled([
-      jget(API.stats),jget(API.packets),jget(API.ssids),jget(API.rate),jget(API.frames),jget(API.sweep),jget(API.events)
+      jget(API.stats),jget(API.packets),jget(API.ssids),jget(API.rate),jget(API.frames),jget(API.sweep),jget(API.events),jget(API.session)
     ]);
     const sweepRes=results[5];
     const eventsRes=results[6];
+    const sessionRes=results[7];
     const firstErr=results.slice(0,5).find(r=>r.status==='rejected');
     if(firstErr){
       setLive(false,'poll error: '+(firstErr.reason&&firstErr.reason.message?firstErr.reason.message:String(firstErr.reason)));
@@ -753,6 +844,16 @@ async function poll(){
         addLog('sys','events endpoint unavailable (older firmware?) - events panel idle');
       }
       renderEvents(null,stats.uptime_s);
+    }
+    if(sessionRes.status==='fulfilled'){
+      renderSession(sessionRes.value);
+      sessionErrOnce=false;
+    }else{
+      if(!sessionErrOnce){
+        sessionErrOnce=true;
+        addLog('sys','session endpoint unavailable (older firmware?) - session panel idle');
+      }
+      renderSession(null);
     }
     setLive(true);
   }catch(e){

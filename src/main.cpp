@@ -32,10 +32,24 @@
  * A 32-entry in-RAM ring (< 4 KB) persists to LittleFS "/events.json" (JSON
  * array, newest last; capped at EVENT_FILE_MAX_BYTES, oldest truncated;
  * write-through debounced at EVENT_FLUSH_DEBOUNCE_MS).
+ * S5 milestone: session capture + CSV/JSON export. One open session at a
+ * time ("session start" / "session stop" / "session list" on the serial
+ * console AND /api/session/start|stop|list); state at /api/session; closed
+ * sessions persist to LittleFS as /sN.json + /sN.csv (monotonic id counter
+ * in /sess.idx, newest 3 closed kept), built from snapshots of the EXISTING
+ * bounded structures (g_bss rows, g_ssid pool, event ring, sweep channel
+ * counters) - no new unbounded stores. While a session is open its snapshot
+ * is rewritten every 60 s (loop() millis() debounce, same pattern as the S4
+ * 5 s events flush) via tmp+rename, which littleFS executes atomically.
+ * Export: /api/session/export?fmt=csv|json&id=N streams the files with
+ * Content-Disposition attachment (bounded heap). No new RTOS tasks; no
+ * littleFS writes on the frame-callback path.
  * Serial console (USB-Serial-JTAG, CRLF, case-insensitive):
  *   sweep [dwell_s] | sweep stop | home | ch N | diag | events | events clear
+ *   | session [start|stop|list]
  * API (additive): /api/sweep, /api/sweep/start?dwell=N, /api/sweep/stop,
- * /api/events.
+ * /api/events, /api/session, /api/session/start, /api/session/stop,
+ * /api/session/list, /api/session/export.
  *
  * Capture uses the esp_wifi promiscuous API available in the IDF floor used
  * by arduino-esp32 2.0.17 (IDF 4.4 base):
@@ -63,7 +77,7 @@
 #include "freertos/task.h"
 
 // ----------------------------- configuration -----------------------------
-#define FW_VERSION    "0.4.0-sweep"
+#define FW_VERSION    "0.5.0-session"
 #define CHIP_NAME     "ESP32-C3"
 #define AP_SSID       "ESP32-SNIFFER"
 #define AP_CHANNEL    6      // default home channel (NVS may hold 1..13)
@@ -97,6 +111,13 @@
 #define EVENT_PAIR_CAP        32      // (bssid,ssid) dedup table
 #define EVENT_DEAUTH_CAP      16      // per-BSSID deauth burst trackers
 #define EVENT_FILE          "/events.json"
+
+// session capture + export (S5)
+#define SESSION_FILE_MAX_BYTES    65536  // per-file cap for /sN.json and /sN.csv
+#define SESSION_FLUSH_DEBOUNCE_MS 60000  // open-session rewrite period (loop millis() gate)
+#define SESSION_KEEP              3      // newest closed sessions retained
+#define SESSION_CSV_BSS_CAP       64     // flat CSV rows, one per BSS (== BSS_MAX)
+#define SESSION_IDX_FILE          "/sess.idx"
 
 // ----------------------------- bounded state -----------------------------
 enum { SEC_OPEN=0, SEC_WEP, SEC_WPA, SEC_WPA2, SEC_WPA3, SEC_WPA2_3, SEC_ENT, SEC_UNKNOWN };
@@ -135,6 +156,7 @@ struct BSS {
   uint32_t first_ms;
   uint32_t last_ms;
   uint16_t beacon_int; // raw field (units of 1.024 ms)
+  uint8_t  ch;         // channel of the last frame seen for this BSS (S5; 0 = unknown)
   int8_t   hist[RSSI_HIST];
   uint8_t  hist_head;
   uint8_t  hist_count;
@@ -276,6 +298,16 @@ static uint8_t   g_ev_baseline_cnt = 0;    // distinct pairs baselined during th
 static EvDeauth  g_ev_deauth[EVENT_DEAUTH_CAP];
 static uint32_t  g_ev_last_spike_ms = 0;
 static uint8_t   g_ev_loaded_boot = 0;     // events loaded from LittleFS at boot
+
+// --------------------------- session logging (S5) -------------------------
+// One active session at a time; all updates from loop()/HTTP/console context
+// (single-threaded loop task) - the frame callback only touches g_total.
+static bool     g_sess_active = false;
+static uint32_t g_sess_start_ms = 0;       // uptime ms at start
+static uint32_t g_sess_total0 = 0;         // g_total at start
+static uint8_t  g_sess_open_id = 0;        // id reserved for the open session
+static uint8_t  g_sess_last_closed = 0;    // last closed id (from /sess.idx)
+static uint32_t g_sess_last_flush_ms = 0;  // 60 s open-snapshot flush gate
 
 // Called with g_mux held. Overwrites the oldest event when full (ring semantics).
 static void ev_push(uint8_t type, uint8_t ch, const char* det, uint32_t now_ms){
@@ -1078,6 +1110,7 @@ static void promiscuous_cb(void* buf, wifi_promiscuous_pkt_type_t ptype){
     if (b){
       if (b->first_ms==0) b->first_ms=now;
       b->last_ms=now;
+      b->ch=ch;                                         // S5: last-seen channel (bounded overwrite)
       if (b->frames < UINT32_MAX) b->frames++;
       if (is_mgmt_ap){
         if (b->rsum_n==0){ b->rmin=rssi; b->rmax=rssi; }
@@ -1430,6 +1463,372 @@ static void sweep_tick(){
   }
 }
 
+// ----------------------------- session logging (S5) ----------------------
+// One open session at a time. All content is snapshotted from the EXISTING
+// bounded structures (g_bss, g_ssid, g_ev_ring, g_sweep_ch) at flush/stop
+// time - no new unbounded stores. littleFS writes happen only from loop()
+// (debounced) and HTTP-handler (loop-context) code paths, never from the
+// frame callback. Closed sessions persist as /sN.json + /sN.csv; N comes
+// from /sess.idx (littleFS text counter - NVS intentionally not used).
+// Rotation keeps the newest SESSION_KEEP closed sessions.
+// Globals live with the other bounded state above; functions here are called
+// from loop(), the serial console and the web handlers only.
+
+// Compact per-BSS row (~32 B) snapshotted under g_mux: avoids copying the
+// full BSS table (hist rings) and keeps the critical section short.
+struct SessBss {
+  uint8_t  mac[6];
+  uint8_t  ssid_idx, sec, ch;
+  int8_t   rssi, rmin, rmax;
+  uint8_t  has_rssi;        // 1 when rsum_n > 0 (mgmt RSSI samples exist)
+  int16_t  ravg;            // rsum / rsum_n, dBm (0 when no sample)
+  uint32_t frames;
+  uint32_t first_ms, last_ms;
+  uint16_t beacon_int;
+};
+// Compact per-channel scalars (only what channels[] needs).
+struct SessCh {
+  uint32_t frames, ctrl, active_ms;
+  uint8_t  bss_n;
+};
+struct SessSnap {
+  int       nb;
+  SessBss   bss[SESSION_CSV_BSS_CAP];
+  SSIDEntry ssid[SSID_MAX];
+  int       nev;
+  EvEntry   ev[EVENT_RING_SIZE];   // newest first
+  SessCh    ch[13];
+  bool      have_base;
+  uint8_t   dwell_s;
+};
+
+static void sess_paths(uint8_t id, char* json, char* csv){
+  snprintf(json, 16, "/s%u.json", (unsigned)id);
+  snprintf(csv, 16, "/s%u.csv", (unsigned)id);
+}
+static uint8_t sess_read_idx(){
+  if (!LittleFS.exists(SESSION_IDX_FILE)) return 0;
+  File f = LittleFS.open(SESSION_IDX_FILE, "r");
+  if (!f) return 0;
+  char buf[8];
+  int n = (int)f.read((uint8_t*)buf, 7);
+  f.close();
+  if (n <= 0) return 0;
+  buf[n] = '\0';
+  long v = strtol(buf, nullptr, 10);
+  return (v >= 0 && v <= 255) ? (uint8_t)v : 0;
+}
+// Write via tmp + rename: lfs_rename() is atomic on littleFS (a reader sees
+// the old file or the new one, never a mix; an existing destination is
+// atomically replaced), so this implements the design's "remove old + write
+// new" in the strictly stronger rename form - a crash mid-write leaves the
+// intact previous file plus a discarded .tmp.
+static bool sess_write_file(const char* path, const String& data){
+  char tmp[24];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  File f = LittleFS.open(tmp, "w");
+  if (!f) return false;
+  size_t w = f.print(data);
+  f.close();
+  if (w != data.length()){ LittleFS.remove(tmp); return false; }
+  if (!LittleFS.rename(tmp, path)){ LittleFS.remove(tmp); return false; }
+  return true;
+}
+// Copy the bounded structures into a SessSnap under g_mux (loop context).
+static void sess_snapshot(SessSnap& sn, uint32_t& now_out){
+  now_out = millis();
+  portENTER_CRITICAL(&g_mux);
+  sn.nb = 0;
+  for (int i = 0; i < BSS_MAX && sn.nb < SESSION_CSV_BSS_CAP; i++) if (g_bss[i].used){
+    SessBss* r = &sn.bss[sn.nb++];
+    const BSS* b = &g_bss[i];
+    memcpy(r->mac, b->mac, 6);
+    r->ssid_idx = b->ssid_idx; r->sec = b->sec; r->ch = b->ch;
+    r->rssi = b->rssi; r->rmin = b->rmin; r->rmax = b->rmax;
+    r->has_rssi = (b->rsum_n > 0) ? 1 : 0;
+    r->ravg = (b->rsum_n > 0) ? (int16_t)(b->rsum / (int64_t)b->rsum_n) : 0;
+    r->frames = b->frames; r->first_ms = b->first_ms; r->last_ms = b->last_ms;
+    r->beacon_int = b->beacon_int;
+  }
+  for (int i = 0; i < SSID_MAX; i++) sn.ssid[i] = g_ssid[i];
+  sn.nev = (int)g_ev_fill;
+  for (int i = 0; i < (int)g_ev_fill; i++){
+    uint32_t idx = (g_ev_head + EVENT_RING_SIZE - 1 - i) % EVENT_RING_SIZE; // newest first
+    sn.ev[i] = g_ev_ring[idx];
+  }
+  sn.have_base = g_have_baseline;
+  sn.dwell_s = g_sw_dwell_s;
+  for (int i = 0; i < 13; i++){
+    sn.ch[i].frames = g_sweep_ch[i].frames;
+    sn.ch[i].ctrl = g_sweep_ch[i].ctrl;
+    sn.ch[i].active_ms = g_sweep_ch[i].active_ms;
+    sn.ch[i].bss_n = g_sweep_ch[i].bss_n;
+  }
+  portEXIT_CRITICAL(&g_mux);
+}
+static void sess_build_meta(String& s, uint8_t id, uint32_t dur_s, uint32_t frames, uint32_t closed_ms){
+  s += "{\"meta\":{\"id\":"; s += (int)id;
+  s += ",\"fw\":\""; s += FW_VERSION; s += "\"";
+  s += ",\"start_uptime_ms\":"; s += (unsigned)g_sess_start_ms;
+  s += ",\"dur_s\":"; s += (unsigned)dur_s;
+  s += ",\"frames\":"; s += (unsigned)frames;
+  s += ",\"home_ch\":"; s += (int)g_home_ch;
+  s += ",\"ap_ssid\":\""; s += AP_SSID; s += "\"";
+  s += ",\"chip_mac\":\""; s += g_ap_mac_str; s += "\"";
+  s += ",\"heap\":"; s += (unsigned)ESP.getFreeHeap();
+  s += ",\"events_n\":"; s += (int)g_ev_fill;
+  s += ",\"closed_uptime_ms\":"; s += (unsigned)closed_ms;
+  s += "}";
+}
+static void sess_build_json(String& s, uint8_t id, uint32_t dur_s, uint32_t frames,
+                            uint32_t closed_ms, const SessSnap& sn, int rows){
+  s.reserve(6144);
+  sess_build_meta(s, id, dur_s, frames, closed_ms);
+  // channels[13]: last completed sweep when a baseline exists, else live
+  // counters derived from g_bss (per-channel BSSID count + summed per-BSS
+  // frames; activity_pct stays 0 - occupancy is sweep-only data).
+  s += ",\"channels\":[";
+  for (int ch = 1; ch <= 13; ch++){
+    if (ch > 1) s += ",";
+    uint32_t fr = 0; uint8_t bssn = 0; uint8_t act = 0;
+    if (sn.have_base){
+      const SessCh* c = &sn.ch[ch-1];
+      fr = c->frames; bssn = c->bss_n;
+      uint32_t dwell_ms = (uint32_t)sn.dwell_s * 1000;
+      uint32_t a = dwell_ms ? (c->active_ms * 100ULL / dwell_ms) : 0;
+      act = (a > 100) ? 100 : (uint8_t)a;
+    } else {
+      for (int i = 0; i < rows; i++){
+        if (sn.bss[i].ch == (uint8_t)ch){ bssn++; fr += sn.bss[i].frames; }
+      }
+    }
+    s += "{\"ch\":"; s += ch;
+    s += ",\"frames\":"; s += (unsigned)fr;
+    s += ",\"bssids\":"; s += (int)bssn;
+    s += ",\"activity_pct\":"; s += (int)act;
+    s += "}";
+  }
+  s += "],\"bss\":[";
+  for (int a = 0; a < rows; a++){
+    const SessBss* b = &sn.bss[a];
+    if (a) s += ",";
+    s += "{\"bssid\":\""; appendMac(s, b->mac); s += "\"";
+    s += ",\"ssid\":";
+    if (b->ssid_idx < 255 && b->ssid_idx < SSID_MAX && sn.ssid[b->ssid_idx].used){
+      s += "\""; appendSsid(s, sn.ssid[b->ssid_idx].data, sn.ssid[b->ssid_idx].len); s += "\"";
+    } else s += "null";
+    s += ",\"sec\":\""; s += sec_name[b->sec <= SEC_UNKNOWN ? b->sec : SEC_UNKNOWN]; s += "\"";
+    s += ",\"ch\":"; s += (int)b->ch;
+    if (b->has_rssi){
+      s += ",\"rssi\":"; s += (int)b->rssi;
+      s += ",\"rmin\":"; s += (int)b->rmin;
+      s += ",\"rmax\":"; s += (int)b->rmax;
+      s += ",\"avg\":"; s += (int)b->ravg;
+    } else s += ",\"rssi\":null,\"rmin\":null,\"rmax\":null,\"avg\":null";
+    s += ",\"count\":"; s += (unsigned)b->frames;
+    s += ",\"first\":"; s += (unsigned)b->first_ms;
+    s += ",\"last\":"; s += (unsigned)b->last_ms;
+    s += ",\"interval_ms\":"; s += (unsigned)(b->beacon_int * 1024UL / 1000UL);
+    s += "}";
+  }
+  s += "],\"ssids\":[";
+  // Current SSID pool; bssid/ch resolved from the first BSS row advertising
+  // the SSID (g_ssid itself carries no bssid/channel).
+  bool firsts = true;
+  for (int i = 0; i < SSID_MAX; i++){
+    if (!sn.ssid[i].used) continue;
+    if (!firsts) s += ",";
+    firsts = false;
+    const SessBss* owner = nullptr;
+    for (int a = 0; a < rows; a++) if (sn.bss[a].ssid_idx == (uint8_t)i){ owner = &sn.bss[a]; break; }
+    s += "{\"ssid\":\""; appendSsid(s, sn.ssid[i].data, sn.ssid[i].len); s += "\",\"bssid\":";
+    if (owner){ s += "\""; appendMac(s, owner->mac); s += "\""; } else s += "null";
+    s += ",\"ch\":"; s += (int)(owner ? owner->ch : 0);
+    s += "}";
+  }
+  s += "],\"events\":[";
+  for (int i = 0; i < sn.nev; i++){          // newest first, same shape as /api/events
+    const EvEntry* e = &sn.ev[i];
+    if (i) s += ",";
+    s += "{\"ts\":"; s += (unsigned)e->ts_s;
+    s += ",\"type\":\""; s += ev_type_name(e->type); s += "\"";
+    s += ",\"ch\":"; s += (int)(e->ch ? e->ch : 0);
+    s += ",\"detail\":\"";
+    appendSsid(s, (const uint8_t*)e->detail, (uint8_t)strlen(e->detail));
+    s += "\"}";
+  }
+  s += "]}";
+}
+// CSV field: always quoted; embedded quotes doubled; control chars replaced
+// so the file stays strictly line-per-record.
+static void sess_csv_field(String& s, const uint8_t* d, uint8_t len){
+  s += '"';
+  for (int i = 0; i < (int)len; i++){
+    uint8_t c = d[i];
+    if (c == '"') s += "\"\"";
+    else if (c == '\n' || c == '\r') s += ' ';
+    else if (c < 0x20 || c == 0x7F) s += '.';
+    else s += (char)c;
+  }
+  s += '"';
+}
+static void sess_build_csv(String& s, uint8_t id, uint32_t dur_s, uint32_t frames,
+                           uint32_t closed_ms, const SessSnap& sn, int rows){
+  s.reserve(4096);
+  s += "# session id="; s += (int)id;
+  s += " fw="; s += FW_VERSION;
+  s += " start_uptime_ms="; s += (unsigned)g_sess_start_ms;
+  s += " dur_s="; s += (unsigned)dur_s;
+  s += " frames="; s += (unsigned)frames;
+  s += " home_ch="; s += (int)g_home_ch;
+  s += " ap_ssid="; s += AP_SSID;
+  s += " chip_mac="; s += g_ap_mac_str;
+  s += " heap="; s += (unsigned)ESP.getFreeHeap();
+  s += " closed_uptime_ms="; s += (unsigned)closed_ms;
+  s += " events_n="; s += (int)sn.nev;
+  s += "\n# columns=bssid,ssid,sec,ch,rssi,rmin,avg,count,first,last,interval_ms\n";
+  for (int a = 0; a < rows; a++){
+    const SessBss* b = &sn.bss[a];
+    char mac[18];
+    hexmac(b->mac, mac);
+    s += mac; s += ',';
+    if (b->ssid_idx < 255 && b->ssid_idx < SSID_MAX && sn.ssid[b->ssid_idx].used)
+      sess_csv_field(s, sn.ssid[b->ssid_idx].data, sn.ssid[b->ssid_idx].len);
+    else s += "\"\"";
+    s += ','; s += sec_name[b->sec <= SEC_UNKNOWN ? b->sec : SEC_UNKNOWN];
+    s += ','; s += (int)b->ch;
+    if (b->has_rssi){
+      s += ','; s += (int)b->rssi;
+      s += ','; s += (int)b->rmin;
+      s += ','; s += (int)b->ravg;
+    } else s += ",,,";
+    s += ','; s += (unsigned)b->frames;
+    s += ','; s += (unsigned)b->first_ms;
+    s += ','; s += (unsigned)b->last_ms;
+    s += ','; s += (unsigned)(b->beacon_int * 1024UL / 1000UL);
+    s += '\n';
+  }
+}
+// Build both session files, shrinking the bss row count until each fits
+// SESSION_FILE_MAX_BYTES (with rows <= 64, events <= 32, ssids <= 32 and a
+// fixed 13-channel block the cap is a safety net, not the norm).
+static bool sess_write_pair(uint8_t id){
+  static SessSnap sn;                       // ~4.8 KB static, same pattern as handle_packets
+  uint32_t now;
+  sess_snapshot(sn, now);
+  uint32_t dur_s = (now >= g_sess_start_ms) ? ((now - g_sess_start_ms) / 1000) : 0;
+  uint32_t gt = g_total;                    // 32-bit reads are atomic; wrap-safe delta
+  uint32_t frames = (gt >= g_sess_total0) ? (gt - g_sess_total0) : gt;
+  int rows = sn.nb;
+  String js, cs;
+  for (;;){
+    js = String(); cs = String();
+    sess_build_json(js, id, dur_s, frames, now, sn, rows);
+    sess_build_csv(cs, id, dur_s, frames, now, sn, rows);
+    if ((int)js.length() <= SESSION_FILE_MAX_BYTES &&
+        (int)cs.length() <= SESSION_FILE_MAX_BYTES) break;
+    if (rows == 0) break;                   // meta only; write anyway
+    rows--;
+  }
+  char jp[16], cp[16];
+  sess_paths(id, jp, cp);
+  return sess_write_file(jp, js) && sess_write_file(cp, cs);
+}
+// Shared entry points (serial console AND HTTP funnel here). One active
+// session at a time; starting while active prints 'already recording'.
+static bool session_start(void){
+  if (g_sess_active){
+    Serial.println("[session] already recording");
+    return false;
+  }
+  g_sess_open_id = (uint8_t)(g_sess_last_closed + 1);   // id reserved for this session
+  g_sess_start_ms = millis();
+  g_sess_total0 = g_total;
+  g_sess_last_flush_ms = millis();
+  g_sess_active = true;
+  Serial.println("[session] recording started");
+  return true;
+}
+// Returns the closed id (>=1), -1 when nothing was recording (no-op message),
+// or 0 when the LittleFS persist failed (session stays open for retry).
+static int session_stop(void){
+  if (!g_sess_active){
+    Serial.println("[session] not recording");
+    return -1;
+  }
+  uint8_t id = g_sess_open_id;
+  if (!sess_write_pair(id)){
+    Serial.println("[session] stop: LittleFS write FAILED (still recording; retry stop)");
+    return 0;
+  }
+  g_sess_active = false;
+  g_sess_last_closed = id;
+  char ibuf[8];
+  snprintf(ibuf, sizeof(ibuf), "%u", (unsigned)id);
+  if (!sess_write_file(SESSION_IDX_FILE, String(ibuf)))
+    Serial.println("[session] warn: /sess.idx write failed (counter may reset on reboot)");
+  // Rotation: on write of sN delete s(N-3) (keep newest SESSION_KEEP closed).
+  char jp[16], cp[16];
+  sess_paths((uint8_t)(id - SESSION_KEEP), jp, cp);
+  LittleFS.remove(jp);
+  LittleFS.remove(cp);
+  Serial.printf("[session] stopped: id=%u -> %s + %s\n", (unsigned)id, jp, cp);
+  return (int)id;
+}
+// 60 s debounced rewrite of the OPEN session snapshot to the reserved id's
+// files (crash-safe-ish; called from loop() only). Silent on success, same
+// as the S4 events flush.
+static void session_flush_open(void){
+  if (!sess_write_pair(g_sess_open_id))
+    Serial.println("[session] flush: LittleFS write failed (retry next period)");
+}
+// Shared list builder (console + HTTP): newest SESSION_KEEP closed sessions.
+// id/bytes from the files; closed_uptime_ms recovered from the JSON meta
+// (meta is written first, so the leading 512 bytes always contain it).
+static void session_list(String& out){
+  out = "{\"sessions\":[";
+  uint8_t hi = g_sess_last_closed;
+  uint8_t lo = (hi >= SESSION_KEEP) ? (uint8_t)(hi - SESSION_KEEP + 1) : (uint8_t)1;
+  bool firsts = true;
+  for (uint8_t id = lo; id <= hi; id++){
+    char jp[16], cp[16];
+    sess_paths(id, jp, cp);
+    (void)cp;
+    if (!LittleFS.exists(jp)) continue;
+    File f = LittleFS.open(jp, "r");
+    if (!f) continue;
+    size_t bytes = f.size();
+    char head[513];
+    int n = (int)f.read((uint8_t*)head, 512);
+    f.close();
+    if (n < 0) n = 0;
+    head[n] = '\0';
+    uint32_t start_ms = 0, dur_s = 0;
+    const char* p = strstr(head, "\"start_uptime_ms\":");
+    if (p) start_ms = strtoul(p + 18, nullptr, 10);
+    p = strstr(head, "\"dur_s\":");
+    if (p) dur_s = strtoul(p + 8, nullptr, 10);
+    if (!firsts) out += ",";
+    firsts = false;
+    out += "{\"id\":"; out += (int)id;
+    out += ",\"closed_uptime_ms\":"; out += (unsigned)(start_ms + dur_s * 1000UL);
+    out += ",\"bytes\":"; out += (unsigned)bytes;
+    out += "}";
+  }
+  out += "]}";
+}
+static void session_print_state_console(void){
+  if (g_sess_active){
+    uint32_t dur = (millis() >= g_sess_start_ms) ? ((millis() - g_sess_start_ms) / 1000) : 0;
+    uint32_t gt = g_total;
+    uint32_t frames = (gt >= g_sess_total0) ? (gt - g_sess_total0) : gt;
+    Serial.printf("[session] REC id=%u elapsed=%lus frames=%lu\n",
+                  (unsigned)g_sess_open_id, (unsigned long)dur, (unsigned long)frames);
+  } else {
+    Serial.printf("[session] IDLE (last closed id=%u)\n", (unsigned)g_sess_last_closed);
+  }
+}
+
 // ----------------------------- serial console ----------------------------
 static void start_sweep_console(uint8_t dwell){
   int r = sweep_start(dwell);
@@ -1493,8 +1892,22 @@ static void process_command(const String& raw){
     } else {
       Serial.println("[console] events: usage: events | events clear");
     }
+  } else if (cmd_l == "session"){
+    String arg_l = arg; arg_l.toLowerCase();
+    if (arg_l == "start"){
+      session_start();                      // echoes '[session] recording started' / 'already recording'
+    } else if (arg_l == "stop"){
+      session_stop();                       // persists + closes; no-op message when idle
+    } else if (arg_l == "list"){
+      String s; session_list(s);
+      Serial.printf("[session] %s\n", s.c_str());
+    } else if (arg_l.length() == 0){
+      session_print_state_console();
+    } else {
+      Serial.println("[console] session: usage: session | session start | session stop | session list");
+    }
   } else {
-    Serial.printf("[console] unknown command: \"%s\" - try: sweep [2-10] | sweep stop | home | ch <1-13> | diag | events | events clear\n",
+    Serial.printf("[console] unknown command: \"%s\" - try: sweep [2-10] | sweep stop | home | ch <1-13> | diag | events | events clear | session [start|stop|list]\n",
                   cmd.c_str());
   }
 }
@@ -1965,6 +2378,89 @@ void handle_404(){
   server.send(404,"application/json","{\"error\":404,\"message\":\"not found\"}");
 }
 
+// ---- session API (S5; additive; existing endpoints unchanged) ----
+void handle_session(){
+  bool active = g_sess_active;
+  uint32_t start_ms = g_sess_start_ms;
+  uint32_t t0 = g_sess_total0;
+  uint32_t gt = g_total;
+  uint32_t frames = (gt >= t0) ? (gt - t0) : gt;
+  uint32_t dur_s = active ? ((millis() - start_ms) / 1000) : 0;
+  String s; s.reserve(96);
+  s += "{\"active\":"; s += (active ? "true" : "false");
+  s += ",\"start_ms\":"; s += (unsigned)start_ms;
+  s += ",\"dur_s\":"; s += (unsigned)dur_s;
+  s += ",\"frames\":"; s += (unsigned)frames;
+  s += "}";
+  server.send(200, "application/json", s);
+}
+void handle_session_start(){
+  if (!session_start()){                    // serial echo '[session] already recording'
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"already recording\"}");
+    return;
+  }
+  String s; s.reserve(96);
+  s += "{\"ok\":true,\"start_ms\":"; s += (unsigned)g_sess_start_ms;
+  s += ",\"frames\":0}";
+  server.send(200, "application/json", s);
+}
+void handle_session_stop(){
+  int id = session_stop();
+  if (id < 0){                              // serial echo '[session] not recording'
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"not recording\"}");
+    return;
+  }
+  if (id == 0){
+    server.send(500, "application/json", "{\"ok\":false,\"error\":\"LittleFS write failed\"}");
+    return;
+  }
+  char jp[16], cp[16];
+  sess_paths((uint8_t)id, jp, cp);
+  String s; s.reserve(160);
+  s += "{\"ok\":true,\"id\":"; s += id;
+  s += ",\"csv\":\""; s += cp;
+  s += "\",\"json\":\""; s += jp; s += "\"}";
+  server.send(200, "application/json", s);
+}
+void handle_session_list(){
+  String s;
+  session_list(s);
+  server.send(200, "application/json", s);
+}
+void handle_session_export(){
+  String fmt = server.hasArg("fmt") ? server.arg("fmt") : String("json");
+  fmt.toLowerCase();
+  if (fmt != "csv" && fmt != "json"){
+    server.send(400, "application/json", "{\"error\":\"fmt must be csv|json\"}");
+    return;
+  }
+  int id = server.hasArg("id") ? server.arg("id").toInt() : (int)g_sess_last_closed;
+  if (id < 1 || id > 255){
+    server.send(404, "application/json", "{\"error\":\"no such session\"}");
+    return;
+  }
+  char path[16];
+  snprintf(path, sizeof(path), "/s%u.%s", (unsigned)id, (fmt == "csv") ? "csv" : "json");
+  if (!LittleFS.exists(path)){
+    server.send(404, "application/json", "{\"error\":\"session file not found\"}");
+    return;
+  }
+  File f = LittleFS.open(path, "r");
+  if (!f){
+    server.send(500, "application/json", "{\"error\":\"file open failed\"}");
+    return;
+  }
+  // Streamed from LittleFS with bounded heap: streamFile() sends the headers
+  // (incl. our extra Content-Disposition) and then WiFiClient::write(File&)
+  // pumps the file in 256-byte chunks - the same proven path handle_index
+  // uses for /index.html.
+  String disp = "attachment; filename=\"s" + String(id) + "." + fmt + "\"";
+  server.sendHeader("Content-Disposition", disp);
+  server.sendHeader("Cache-Control", "no-store");
+  server.streamFile(f, (fmt == "csv") ? "text/csv" : "application/json");
+  f.close();
+}
+
 // ----------------------------- BOOT button -------------------------------
 static void reset_stats(){
   portENTER_CRITICAL(&g_mux);
@@ -2023,7 +2519,9 @@ static void banner(){
                  g_ap_ip.c_str(), g_ap_mac_str);
   Serial.printf("home channel=%u (NVS-persisted)\n", (unsigned)g_home_ch);
   Serial.printf("events ready (loaded=%u)\n", (unsigned)g_ev_loaded_boot);
-  Serial.println("console commands: sweep [2-10] | sweep stop | home | ch <1-13> | diag | events | events clear");
+  Serial.printf("sessions: last closed id=%u (/sess.idx) - newest %u kept\n",
+                 (unsigned)g_sess_last_closed, (unsigned)SESSION_KEEP);
+  Serial.println("console commands: sweep [2-10] | sweep stop | home | ch <1-13> | diag | events | events clear | session [start|stop|list]");
 }
 void setup(){
   Serial.begin(MONITOR_BAUD);
@@ -2048,6 +2546,8 @@ void setup(){
 
   g_ev_loaded_boot = events_load();   // S4: load persisted events (missing/corrupt -> empty)
 
+  g_sess_last_closed = sess_read_idx();  // S5: session id counter (LittleFS /sess.idx)
+
   server.on("/", HTTP_GET, handle_index);
   server.on("/api/stats", HTTP_GET, handle_stats);
   server.on("/api/packets", HTTP_GET, handle_packets);
@@ -2059,6 +2559,11 @@ void setup(){
   server.on("/api/sweep", HTTP_GET, handle_sweep);
   server.on("/api/sweep/start", HTTP_GET, handle_sweep_start);
   server.on("/api/sweep/stop", HTTP_GET, handle_sweep_stop);
+  server.on("/api/session", HTTP_GET, handle_session);
+  server.on("/api/session/start", HTTP_GET, handle_session_start);
+  server.on("/api/session/stop", HTTP_GET, handle_session_stop);
+  server.on("/api/session/list", HTTP_GET, handle_session_list);
+  server.on("/api/session/export", HTTP_GET, handle_session_export);
   server.onNotFound(handle_404);
   server.begin();
 
@@ -2106,6 +2611,12 @@ void loop(){
     portENTER_CRITICAL(&g_mux); g_ev_pending = 0; portEXIT_CRITICAL(&g_mux);
     events_flush();
     g_ev_last_flush_ms = millis();
+  }
+  // S5: debounced crash-safe rewrite of the OPEN session snapshot (loop-side
+  // LittleFS writes only; same gate pattern as the events flush above).
+  if (g_sess_active && (millis() - g_sess_last_flush_ms) >= SESSION_FLUSH_DEBOUNCE_MS){
+    g_sess_last_flush_ms = millis();
+    session_flush_open();
   }
   delay(2);
 }
