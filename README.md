@@ -19,11 +19,12 @@ A **standalone passive 2.4 GHz WiFi channel analyser** with an offline **8-bit d
 - **LIVE PACKETS** — capture ring with subtype names, type filter, hide-own-traffic toggle
 - **NETWORKS** — per-BSSID table (RSSI, rates, SSID), row-click RSSI history chart
 - **PACKET RATE** — 120 s throughput chart with peak marker; **FRAME MIX** and **TOP MGMT SUBTYPES** bars
+- **CLIENTS + OUI** — passive station tracker (48-client LRU table) with a fully offline 3,831-prefix IEEE OUI vendor table (PROGMEM, boot-asserted, registry-audited), per-vendor AP association, and optional on-device `/oui.csv` overlay
 - **SESSIONS** — one-click recording sessions with crash-safe 60 s debounced flush, rotating keep-3 store on littleFS, downloadable **CSV** (strict line-per-record) and **JSON** exports, and a client-side PNG snapshot of the rate chart — no cloud involved
 - **EVENTS engine** — on-device anomaly detection: `NEW_SSID` (60 s grace), `DEAUTH_BURST` (3 in 10 s), `RATE_SPIKE` (≥2× vs 60 s baseline, 15 s rearm), suspicious pairs; littleFS-backed ring + `/api/events`
 - **ADVENTURE LOG** — the dashboard narrates discoveries in retro style
 - **FARM / TRON themes** + procedural 8-bit SFX (WebAudio) — everything is local; the UI has **zero external resources** (two OFL fonts embedded as data-URIs)
-- **Serial console** — `sweep [2-10|stop]`, `home`, `ch <1-13>`, `diag`, `events [clear]`, `session [start|stop|list]`
+- **Serial console** — `sweep [2-10|stop]`, `home`, `ch <1-13>`, `diag`, `events [clear]`, `session [start|stop|list]`, `clients`, `oui`
 
 ## Architecture
 
@@ -31,7 +32,7 @@ A **standalone passive 2.4 GHz WiFi channel analyser** with an offline **8-bit d
 |---|---|
 | Firmware | `src/main.cpp` — 2,111 lines, Arduino framework, **legacy** `esp_wifi_set_promiscuous*` API (IDF 4.4-compatible), all timing loop/`millis()`-driven |
 | Dashboard | `data/index.html` — 772 lines, single file, no build step, no dependencies |
-| API | 16 GET endpoints, 2 s polling via `Promise.allSettled` |
+| API | 17 GET endpoints, 2 s polling via `Promise.allSettled` |
 | Storage | littleFS event ring (`/events.json`, 16 KB cap, 5 s debounce flush) + NVS (`sniffer/homech`) |
 | Bounds | 512-packet ring · 64 BSS · 32 SSID · 32 events · saturation-safe semantics |
 
