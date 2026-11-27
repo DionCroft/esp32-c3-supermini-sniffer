@@ -98,7 +98,7 @@ Known quirks worth documenting: a `460800` baud USB-Serial-JTAG resync race can 
 - [x] S3 — Channel sweep + commissioning (C1/C2, byte-verified partitions)
 - [x] S4 — Event/anomaly engine (**C3 commissioned**: flashed, partitions verified, events proven live on-device)
 - [x] S5 — Session logging + CSV/JSON export + chart PNG snapshot (**C4 commissioned**: lifecycle, rotation, exports and byte-identical dashboard proven on-device over HTTP)
-- [ ] S6 — Offline OUI vendor lookup + client tracker
+- [x] S6 — Offline OUI vendor table + client tracker (**C5 commissioned**: 3,831-prefix IEEE-registry-audited table, live client table and vendor behaviour proven on-device)
 - [ ] S7 — Beacon sequence analysis (BSS uptime/restart detection)
 - [ ] S9 — Device config panel + presets + status LED + OTA
 
